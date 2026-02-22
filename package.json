@@ -1,0 +1,36 @@
+{
+  "name": "mcp-doc",
+  "version": "0.1.0",
+  "description": "An MCP server that auto-discovers and health-checks all your other MCP servers",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-doc": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "health-check",
+    "monitoring",
+    "developer-tools"
+  ],
+  "author": "Matt Raynor",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "better-sqlite3": "^12.6.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.3.0",
+    "typescript": "^5.9.3"
+  }
+}
