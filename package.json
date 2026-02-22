@@ -1,5 +1,5 @@
 {
-  "name": "mcp-doc",
+  "name": "@mnraynor90/mcp-doc",
   "version": "0.1.0",
   "description": "An MCP server that auto-discovers and health-checks all your other MCP servers",
   "type": "module",
@@ -7,6 +7,10 @@
   "bin": {
     "mcp-doc": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
@@ -21,6 +25,10 @@
   ],
   "author": "Matt Raynor",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mattyray/mcp-doc.git"
+  },
   "engines": {
     "node": ">=18"
   },

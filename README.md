@@ -44,7 +44,7 @@ Add to your Claude Code config (`~/.claude.json` for global, or `.mcp.json` for 
   "mcpServers": {
     "doctor": {
       "command": "npx",
-      "args": ["mcp-doc"]
+      "args": ["@mnraynor90/mcp-doc"]
     }
   }
 }
