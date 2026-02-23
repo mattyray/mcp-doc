@@ -5,14 +5,32 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { discoverServers, findDuplicates, type ServerConfig } from "./scanner.js";
 import { checkAllServers, checkServer } from "./health.js";
-import { saveResults, getServerHistory, getLatestResults, getServerStats } from "./history.js";
+import { saveResults, getServerHistory, getLatestResults, getServerStats, saveProxyCall } from "./history.js";
+import { resolveServer } from "./client.js";
+import { fetchAllTools, searchTools, formatToolList, callToolOnServer } from "./proxy.js";
 
 /**
- * Redact sensitive values from args (tokens, keys, passwords).
+ * Redact passwords from connection-string URLs (e.g. postgres://user:pass@host).
+ */
+function redactUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.password) {
+      parsed.password = "****";
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Redact sensitive values from args (tokens, keys, passwords, URLs).
  */
 function redactArgs(args: string[]): string {
   const sensitivePatterns = /^(sntryu_|lsv2_|sk-|sk_|ghp_|ghu_|xox[bpas]-|key-|token-|Bearer\s)/i;
   const sensitiveFlags = ["--access-token", "--api-key", "--token", "--secret", "--password"];
+  const urlWithAuthPattern = /^[a-z][a-z0-9+.-]*:\/\/[^/]*:[^/]*@/i;
 
   return args
     .map((arg, i) => {
@@ -24,6 +42,10 @@ function redactArgs(args: string[]): string {
       if (sensitivePatterns.test(arg)) {
         return arg.substring(0, 6) + "…" + arg.substring(arg.length - 4);
       }
+      // Redact passwords in connection URLs
+      if (urlWithAuthPattern.test(arg)) {
+        return redactUrl(arg);
+      }
       return arg;
     })
     .join(" ");
@@ -31,7 +53,7 @@ function redactArgs(args: string[]): string {
 
 const server = new McpServer({
   name: "mcp-doc",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 // ─── Tool: list_servers ─────────────────────────────────────────────────────
@@ -255,6 +277,140 @@ server.tool(
     return {
       content: [{ type: "text", text: output }],
     };
+  }
+);
+
+// ─── Tool: list_all_tools ────────────────────────────────────────────────────
+
+server.tool(
+  "list_all_tools",
+  "Fetch complete tool catalog from all discovered MCP servers. Connects to each server live and returns every tool's name, description, and parameters.",
+  {
+    server: z.string().optional().describe("Filter to a specific server name"),
+    project: z.string().optional().describe("Filter to a specific project"),
+  },
+  async ({ server: serverFilter, project }) => {
+    const servers = discoverServers();
+    if (servers.length === 0) {
+      return { content: [{ type: "text", text: "No MCP servers found." }] };
+    }
+
+    const { tools, errors } = await fetchAllTools(servers, serverFilter, project);
+    const output = formatToolList(tools, errors);
+    return { content: [{ type: "text", text: output }] };
+  }
+);
+
+// ─── Tool: search_tools ─────────────────────────────────────────────────────
+
+server.tool(
+  "search_tools",
+  "Search for tools by keyword across all discovered MCP servers. Matches against tool names and descriptions.",
+  {
+    query: z.string().describe("Search term to match against tool names and descriptions"),
+    server: z.string().optional().describe("Limit search to a specific server"),
+    project: z.string().optional().describe("Limit search to a specific project"),
+  },
+  async ({ query, server: serverFilter, project }) => {
+    const servers = discoverServers();
+    if (servers.length === 0) {
+      return { content: [{ type: "text", text: "No MCP servers found." }] };
+    }
+
+    const { tools, errors } = await searchTools(servers, query, serverFilter, project);
+
+    if (tools.length === 0) {
+      let output = `No tools found matching "${query}".`;
+      if (errors.length > 0) {
+        output += `\n\nSome servers had errors:\n`;
+        for (const e of errors) {
+          output += `  ✗ ${e.project}/${e.server}: ${e.error}\n`;
+        }
+      }
+      return { content: [{ type: "text", text: output }] };
+    }
+
+    const output = formatToolList(tools, errors);
+    return { content: [{ type: "text", text: output.replace(/^Found \d+ tools/, `Found ${tools.length} tools matching "${query}"`) }] };
+  }
+);
+
+// ─── Tool: call_tool ────────────────────────────────────────────────────────
+
+server.tool(
+  "call_tool",
+  "Call any tool on any discovered MCP server. Spawns the target server, connects via MCP, invokes the tool, and returns the result. Use list_all_tools or search_tools to discover available tools first.",
+  {
+    server: z.string().describe("Name of the target MCP server (e.g., 'sentry', 'langsmith')"),
+    tool: z.string().describe("Name of the tool to invoke on that server"),
+    arguments: z.string().optional().default("{}").describe("Arguments as a JSON string (e.g. '{\"project_slug\": \"my-project\"}')"),
+    project: z.string().optional().describe("Project name to disambiguate if server exists in multiple projects"),
+  },
+  async ({ server: serverName, tool: toolName, arguments: toolArgsJson, project }) => {
+    const servers = discoverServers();
+
+    let target;
+    try {
+      target = resolveServer(servers, serverName, project);
+    } catch (err) {
+      return {
+        content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
+      };
+    }
+
+    // Parse arguments JSON string
+    let toolArgs: Record<string, unknown>;
+    try {
+      toolArgs = JSON.parse(toolArgsJson) as Record<string, unknown>;
+    } catch {
+      return {
+        content: [{ type: "text" as const, text: `Invalid JSON in arguments: ${toolArgsJson}` }],
+      };
+    }
+
+    try {
+      const result = await callToolOnServer(target, toolName, toolArgs);
+
+      // Log the proxy call
+      saveProxyCall({
+        server: result.serverName,
+        project: target.project,
+        tool: result.toolName,
+        status: result.isError ? "fail" : "ok",
+        latencyMs: result.latencyMs,
+        error: null,
+        calledAt: new Date().toISOString(),
+      });
+
+      // Serialize proxied result as text
+      const header = `[Proxied: ${target.project}/${serverName} → ${toolName} in ${(result.latencyMs / 1000).toFixed(1)}s]`;
+      const body = result.content
+        .map((block) => {
+          if (block.type === "text" && "text" in block) return block.text as string;
+          return JSON.stringify(block, null, 2);
+        })
+        .join("\n");
+
+      return {
+        content: [{ type: "text" as const, text: `${header}\n\n${body}` }],
+      };
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+
+      saveProxyCall({
+        server: serverName,
+        project: target.project,
+        tool: toolName,
+        status: "fail",
+        latencyMs: 0,
+        error: errorMsg,
+        calledAt: new Date().toISOString(),
+      });
+
+      return {
+        content: [{ type: "text" as const, text: `Failed to call ${serverName}/${toolName}: ${errorMsg}` }],
+      };
+    }
   }
 );
 
