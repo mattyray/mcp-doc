@@ -1,0 +1,1588 @@
+================================================
+  mcp-doc — Source Code Export
+  Generated: Sun Feb 22 20:27:00 EST 2026
+================================================
+
+════════════════════════════════════════════════
+  package.json
+════════════════════════════════════════════════
+
+{
+  "name": "@mnraynor90/mcp-doc",
+  "version": "0.2.0",
+  "description": "An MCP server that auto-discovers and health-checks all your other MCP servers",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-doc": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "health-check",
+    "monitoring",
+    "developer-tools"
+  ],
+  "author": "Matt Raynor",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mattyray/mcp-doc.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "typescript": "^5.9.3"
+  }
+}
+
+
+════════════════════════════════════════════════
+  tsconfig.json
+════════════════════════════════════════════════
+
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}
+
+
+════════════════════════════════════════════════
+  src/client.ts
+════════════════════════════════════════════════
+
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import type { DiscoveredServer } from "./scanner.js";
+
+export const CLIENT_TIMEOUT = 30_000;
+
+/**
+ * Returns a reason to skip this server, or null if it should be checked.
+ */
+export function shouldSkipServer(server: DiscoveredServer): string | null {
+  // Skip remote/HTTP servers
+  if (!server.config.command) {
+    return "Remote/HTTP servers not yet supported";
+  }
+
+  // Skip self-references to avoid infinite recursion
+  const cmd = server.config.command || "";
+  const args = (server.config.args || []).join(" ");
+  const fullCommand = `${cmd} ${args}`.toLowerCase();
+  if (
+    fullCommand.includes("mcp-doc") ||
+    fullCommand.includes("@mnraynor90/mcp-doc") ||
+    server.name === "mcp-doc"
+  ) {
+    return "Skipped self-check";
+  }
+
+  return null;
+}
+
+/**
+ * Find a server by name, optionally filtering by project.
+ * Throws descriptive errors if not found or ambiguous.
+ */
+export function resolveServer(
+  servers: DiscoveredServer[],
+  serverName: string,
+  project?: string
+): DiscoveredServer {
+  let matches = servers.filter((s) => s.name === serverName);
+
+  if (project) {
+    matches = matches.filter((s) =>
+      s.project.toLowerCase().includes(project.toLowerCase())
+    );
+  }
+
+  if (matches.length === 0) {
+    const available = [...new Set(servers.map((s) => s.name))].join(", ");
+    throw new Error(
+      `Server "${serverName}" not found. Available: ${available}`
+    );
+  }
+
+  if (matches.length > 1 && !project) {
+    const projects = matches.map((s) => `${s.project}/${s.name}`).join(", ");
+    throw new Error(
+      `Multiple servers named "${serverName}" found: ${projects}. Specify a project to disambiguate.`
+    );
+  }
+
+  return matches[0];
+}
+
+/**
+ * Race a promise against a timeout.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out (${ms}ms)`)), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
+/**
+ * Spawn an MCP server, connect via SDK Client, run a callback, and always clean up.
+ */
+export async function withClient<T>(
+  server: DiscoveredServer,
+  fn: (client: Client) => Promise<T>,
+  timeoutMs = CLIENT_TIMEOUT
+): Promise<T> {
+  const transport = new StdioClientTransport({
+    command: server.config.command!,
+    args: server.config.args || [],
+    env: { ...process.env, ...(server.config.env || {}) } as Record<string, string>,
+    stderr: "pipe",
+  });
+
+  const client = new Client(
+    { name: "mcp-doc", version: "0.2.0" },
+    { capabilities: {} }
+  );
+
+  try {
+    await withTimeout(client.connect(transport), timeoutMs, "Connection");
+    return await withTimeout(fn(client), timeoutMs, "Operation");
+  } finally {
+    try {
+      await client.close();
+    } catch {
+      // Already dead — force kill via transport
+      try {
+        await transport.close();
+      } catch {
+        // Best effort
+      }
+    }
+  }
+}
+
+
+════════════════════════════════════════════════
+  src/health.ts
+════════════════════════════════════════════════
+
+import type { DiscoveredServer } from "./scanner.js";
+import { withClient, shouldSkipServer } from "./client.js";
+
+export interface HealthResult {
+  server: string;
+  project: string;
+  status: "ok" | "fail" | "skip";
+  latencyMs: number;
+  toolCount: number;
+  tools: string[];
+  error: string | null;
+  checkedAt: string;
+}
+
+/**
+ * Health check a single server.
+ */
+export async function checkServer(server: DiscoveredServer): Promise<HealthResult> {
+  const skipReason = shouldSkipServer(server);
+  if (skipReason) {
+    return {
+      server: server.name,
+      project: server.project,
+      status: "skip",
+      latencyMs: 0,
+      toolCount: 0,
+      tools: [],
+      error: skipReason,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  const start = Date.now();
+
+  try {
+    return await withClient(server, async (client) => {
+      const toolsResult = await client.listTools();
+      const toolNames = toolsResult.tools.map((t) => t.name);
+
+      return {
+        server: server.name,
+        project: server.project,
+        status: "ok" as const,
+        latencyMs: Date.now() - start,
+        toolCount: toolNames.length,
+        tools: toolNames,
+        error: null,
+        checkedAt: new Date().toISOString(),
+      };
+    });
+  } catch (err) {
+    return {
+      server: server.name,
+      project: server.project,
+      status: "fail",
+      latencyMs: Date.now() - start,
+      toolCount: 0,
+      tools: [],
+      error: err instanceof Error ? err.message : String(err),
+      checkedAt: new Date().toISOString(),
+    };
+  }
+}
+
+/**
+ * Health check all discovered servers. Runs sequentially to avoid resource contention.
+ */
+export async function checkAllServers(
+  servers: DiscoveredServer[],
+  projectFilter?: string
+): Promise<HealthResult[]> {
+  const filtered = projectFilter
+    ? servers.filter((s) => s.project.toLowerCase().includes(projectFilter.toLowerCase()))
+    : servers;
+
+  const results: HealthResult[] = [];
+  for (const server of filtered) {
+    results.push(await checkServer(server));
+  }
+  return results;
+}
+
+
+════════════════════════════════════════════════
+  src/history.ts
+════════════════════════════════════════════════
+
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+import type { HealthResult } from "./health.js";
+
+const DATA_DIR = join(homedir(), ".mcp-doc");
+const HISTORY_PATH = join(DATA_DIR, "history.json");
+const MAX_ENTRIES = 500; // Keep history bounded
+
+export interface ProxyCallRecord {
+  server: string;
+  project: string;
+  tool: string;
+  status: "ok" | "fail";
+  latencyMs: number;
+  error: string | null;
+  calledAt: string;
+}
+
+interface HistoryFile {
+  version: 1;
+  checks: StoredCheck[];
+  proxyCalls?: ProxyCallRecord[];
+}
+
+interface StoredCheck {
+  server: string;
+  project: string;
+  status: string;
+  latencyMs: number;
+  toolCount: number;
+  tools: string[];
+  error: string | null;
+  checkedAt: string;
+}
+
+function ensureDir(): void {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function readHistory(): HistoryFile {
+  try {
+    if (!existsSync(HISTORY_PATH)) return { version: 1, checks: [], proxyCalls: [] };
+    const raw = readFileSync(HISTORY_PATH, "utf-8");
+    const data = JSON.parse(raw) as HistoryFile;
+    if (data.version === 1 && Array.isArray(data.checks)) {
+      if (!data.proxyCalls) data.proxyCalls = [];
+      return data;
+    }
+    return { version: 1, checks: [], proxyCalls: [] };
+  } catch {
+    return { version: 1, checks: [], proxyCalls: [] };
+  }
+}
+
+function writeHistory(data: HistoryFile): void {
+  ensureDir();
+  // Trim to max entries (keep most recent)
+  if (data.checks.length > MAX_ENTRIES) {
+    data.checks = data.checks.slice(-MAX_ENTRIES);
+  }
+  if (data.proxyCalls && data.proxyCalls.length > MAX_ENTRIES) {
+    data.proxyCalls = data.proxyCalls.slice(-MAX_ENTRIES);
+  }
+  writeFileSync(HISTORY_PATH, JSON.stringify(data, null, 2), "utf-8");
+}
+
+/**
+ * Save a single health check result.
+ */
+export function saveResult(result: HealthResult): void {
+  const history = readHistory();
+  history.checks.push({
+    server: result.server,
+    project: result.project,
+    status: result.status,
+    latencyMs: result.latencyMs,
+    toolCount: result.toolCount,
+    tools: result.tools,
+    error: result.error,
+    checkedAt: result.checkedAt,
+  });
+  writeHistory(history);
+}
+
+/**
+ * Save multiple results.
+ */
+export function saveResults(results: HealthResult[]): void {
+  const history = readHistory();
+  for (const result of results) {
+    history.checks.push({
+      server: result.server,
+      project: result.project,
+      status: result.status,
+      latencyMs: result.latencyMs,
+      toolCount: result.toolCount,
+      tools: result.tools,
+      error: result.error,
+      checkedAt: result.checkedAt,
+    });
+  }
+  writeHistory(history);
+}
+
+export interface HistoryEntry {
+  server: string;
+  project: string;
+  status: string;
+  latencyMs: number;
+  toolCount: number;
+  error: string | null;
+  checkedAt: string;
+}
+
+/**
+ * Get health check history for a specific server.
+ */
+export function getServerHistory(serverName: string, limit = 20): HistoryEntry[] {
+  const history = readHistory();
+  return history.checks
+    .filter((c) => c.server === serverName)
+    .sort((a, b) => b.checkedAt.localeCompare(a.checkedAt))
+    .slice(0, limit)
+    .map(({ tools, ...rest }) => rest);
+}
+
+/**
+ * Get the most recent health check for each server.
+ */
+export function getLatestResults(): HistoryEntry[] {
+  const history = readHistory();
+  const latest = new Map<string, StoredCheck>();
+
+  for (const check of history.checks) {
+    const key = `${check.server}::${check.project}`;
+    const existing = latest.get(key);
+    if (!existing || check.checkedAt > existing.checkedAt) {
+      latest.set(key, check);
+    }
+  }
+
+  return Array.from(latest.values())
+    .sort((a, b) => `${a.project}/${a.server}`.localeCompare(`${b.project}/${b.server}`))
+    .map(({ tools, ...rest }) => rest);
+}
+
+/**
+ * Get summary stats for a server.
+ */
+export function getServerStats(serverName: string): {
+  totalChecks: number;
+  okCount: number;
+  failCount: number;
+  uptimePercent: number;
+  lastHealthy: string | null;
+  lastFailed: string | null;
+} {
+  const history = readHistory();
+  const checks = history.checks.filter((c) => c.server === serverName);
+
+  const okCount = checks.filter((c) => c.status === "ok").length;
+  const failCount = checks.filter((c) => c.status === "fail").length;
+  const total = checks.length || 1;
+
+  const sorted = [...checks].sort((a, b) => b.checkedAt.localeCompare(a.checkedAt));
+  const lastHealthy = sorted.find((c) => c.status === "ok")?.checkedAt || null;
+  const lastFailed = sorted.find((c) => c.status === "fail")?.checkedAt || null;
+
+  return {
+    totalChecks: checks.length,
+    okCount,
+    failCount,
+    uptimePercent: Math.round((okCount / total) * 100),
+    lastHealthy,
+    lastFailed,
+  };
+}
+
+/**
+ * Save a proxy call record for audit logging.
+ */
+export function saveProxyCall(record: ProxyCallRecord): void {
+  const history = readHistory();
+  if (!history.proxyCalls) history.proxyCalls = [];
+  history.proxyCalls.push(record);
+  writeHistory(history);
+}
+
+
+════════════════════════════════════════════════
+  src/index.ts
+════════════════════════════════════════════════
+
+#!/usr/bin/env node
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import { discoverServers, findDuplicates, type ServerConfig } from "./scanner.js";
+import { checkAllServers, checkServer } from "./health.js";
+import { saveResults, getServerHistory, getLatestResults, getServerStats, saveProxyCall } from "./history.js";
+import { resolveServer } from "./client.js";
+import { fetchAllTools, searchTools, formatToolList, callToolOnServer } from "./proxy.js";
+
+/**
+ * Redact passwords from connection-string URLs (e.g. postgres://user:pass@host).
+ */
+function redactUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.password) {
+      parsed.password = "****";
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Redact sensitive values from args (tokens, keys, passwords, URLs).
+ */
+function redactArgs(args: string[]): string {
+  const sensitivePatterns = /^(sntryu_|lsv2_|sk-|sk_|ghp_|ghu_|xox[bpas]-|key-|token-|Bearer\s)/i;
+  const sensitiveFlags = ["--access-token", "--api-key", "--token", "--secret", "--password"];
+  const urlWithAuthPattern = /^[a-z][a-z0-9+.-]*:\/\/[^/]*:[^/]*@/i;
+
+  return args
+    .map((arg, i) => {
+      // Redact values that follow sensitive flags
+      if (i > 0 && sensitiveFlags.includes(args[i - 1])) {
+        return arg.substring(0, 6) + "…" + arg.substring(arg.length - 4);
+      }
+      // Redact values that look like tokens
+      if (sensitivePatterns.test(arg)) {
+        return arg.substring(0, 6) + "…" + arg.substring(arg.length - 4);
+      }
+      // Redact passwords in connection URLs
+      if (urlWithAuthPattern.test(arg)) {
+        return redactUrl(arg);
+      }
+      return arg;
+    })
+    .join(" ");
+}
+
+const server = new McpServer({
+  name: "mcp-doc",
+  version: "0.2.0",
+});
+
+// ─── Tool: list_servers ─────────────────────────────────────────────────────
+
+server.tool(
+  "list_servers",
+  "Discover all MCP servers configured across your projects and IDEs. Scans ~/.claude.json, .mcp.json files, Cursor config, and VS Code config. Returns a complete inventory with no side effects.",
+  {},
+  async () => {
+    const servers = discoverServers();
+
+    if (servers.length === 0) {
+      return {
+        content: [{ type: "text", text: "No MCP servers found on this machine." }],
+      };
+    }
+
+    // Group by project
+    const byProject = new Map<string, typeof servers>();
+    for (const s of servers) {
+      const group = byProject.get(s.project) || [];
+      group.push(s);
+      byProject.set(s.project, group);
+    }
+
+    let output = `Found ${servers.length} servers across ${byProject.size} projects:\n\n`;
+
+    for (const [project, projectServers] of byProject) {
+      output += `${project} (${projectServers.length} server${projectServers.length > 1 ? "s" : ""}):\n`;
+      for (const s of projectServers) {
+        const cmd = s.config.command || s.config.url || "unknown";
+        const args = redactArgs(s.config.args || []);
+        output += `  - ${s.name}: ${cmd} ${args}\n`;
+        output += `    config: ${s.configFile}\n`;
+      }
+      output += "\n";
+    }
+
+    // Check for duplicates
+    const duplicates = findDuplicates(servers);
+    if (duplicates.size > 0) {
+      output += "Duplicates detected (same server in multiple projects):\n";
+      for (const [, group] of duplicates) {
+        const names = group.map((s) => `${s.project}/${s.name}`).join(", ");
+        output += `  - ${names}\n`;
+      }
+    }
+
+    return {
+      content: [{ type: "text", text: output }],
+    };
+  }
+);
+
+// ─── Tool: check_health ─────────────────────────────────────────────────────
+
+server.tool(
+  "check_health",
+  "Health-check all discovered MCP servers by spawning each one, performing the MCP handshake, and verifying it responds. Saves results to history. Optionally filter by project name.",
+  {
+    project: z.string().optional().describe("Filter to a specific project name (partial match)"),
+  },
+  async ({ project }) => {
+    const servers = discoverServers();
+
+    if (servers.length === 0) {
+      return {
+        content: [{ type: "text", text: "No MCP servers found to check." }],
+      };
+    }
+
+    const startTime = Date.now();
+    const results = await checkAllServers(servers, project);
+    const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+
+    // Save to history
+    saveResults(results);
+
+    const ok = results.filter((r) => r.status === "ok").length;
+    const fail = results.filter((r) => r.status === "fail").length;
+    const skip = results.filter((r) => r.status === "skip").length;
+
+    let output = `Health check complete (${results.length} servers, ${totalTime}s):\n\n`;
+
+    for (const r of results) {
+      const icon = r.status === "ok" ? "✓" : r.status === "fail" ? "✗" : "○";
+      const status = r.status.toUpperCase().padEnd(4);
+      const latency = r.status !== "skip" ? `${(r.latencyMs / 1000).toFixed(1)}s` : "  -";
+      const tools = r.toolCount > 0 ? `${r.toolCount} tools` : "";
+      const error = r.error && r.status === "fail" ? `  Error: ${r.error}` : "";
+
+      output += `${icon} ${r.project}/${r.server}  ${status}  ${latency.padStart(6)}  ${tools}${error}\n`;
+    }
+
+    output += `\n${ok} healthy, ${fail} failing`;
+    if (skip > 0) output += `, ${skip} skipped`;
+
+    return {
+      content: [{ type: "text", text: output }],
+    };
+  }
+);
+
+// ─── Tool: server_history ───────────────────────────────────────────────────
+
+server.tool(
+  "server_history",
+  "Show health check history for a specific MCP server. Displays past results and uptime stats from the local database.",
+  {
+    server: z.string().describe("Name of the MCP server (e.g., 'langsmith', 'sentry')"),
+    limit: z.number().optional().default(10).describe("Number of history entries to show"),
+  },
+  async ({ server: serverName, limit }) => {
+    const history = getServerHistory(serverName, limit);
+
+    if (history.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: `No health check history for "${serverName}". Run check_health first.`,
+        }],
+      };
+    }
+
+    const stats = getServerStats(serverName);
+
+    let output = `History for "${serverName}":\n\n`;
+
+    for (const h of history) {
+      const icon = h.status === "ok" ? "✓" : "✗";
+      const date = new Date(h.checkedAt).toLocaleString();
+      const latency = `${(h.latencyMs / 1000).toFixed(1)}s`;
+      const error = h.error ? `  ${h.error}` : "";
+      output += `${icon} ${date}  ${h.status.toUpperCase()}  ${latency}  ${h.toolCount} tools${error}\n`;
+    }
+
+    output += `\nStats: ${stats.totalChecks} checks, ${stats.uptimePercent}% uptime\n`;
+    if (stats.lastHealthy) {
+      output += `Last healthy: ${new Date(stats.lastHealthy).toLocaleString()}\n`;
+    }
+    if (stats.lastFailed) {
+      output += `Last failed:  ${new Date(stats.lastFailed).toLocaleString()}\n`;
+    }
+
+    return {
+      content: [{ type: "text", text: output }],
+    };
+  }
+);
+
+// ─── Tool: server_detail ────────────────────────────────────────────────────
+
+server.tool(
+  "server_detail",
+  "Show detailed information about a specific MCP server: config, last health check, full tool list, and whether it appears in multiple projects.",
+  {
+    server: z.string().describe("Name of the MCP server (e.g., 'langsmith', 'sentry')"),
+    project: z.string().optional().describe("Project name to disambiguate if server exists in multiple projects"),
+  },
+  async ({ server: serverName, project }) => {
+    const allServers = discoverServers();
+    let matches = allServers.filter((s) => s.name === serverName);
+
+    if (project) {
+      matches = matches.filter((s) => s.project.toLowerCase().includes(project.toLowerCase()));
+    }
+
+    if (matches.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: `Server "${serverName}" not found. Use list_servers to see all available servers.`,
+        }],
+      };
+    }
+
+    const target = matches[0];
+    const config = target.config;
+
+    let output = `${target.name} (${target.project})\n`;
+    output += `${"─".repeat(40)}\n`;
+
+    if (config.command) {
+      output += `Command: ${config.command} ${redactArgs(config.args || [])}\n`;
+    }
+    if (config.url) {
+      output += `URL: ${config.url}\n`;
+    }
+    output += `Config:  ${target.configFile}\n`;
+
+    // Run a live health check
+    output += `\nRunning health check...\n`;
+    const result = await checkServer(target);
+    saveResults([result]);
+
+    const icon = result.status === "ok" ? "✓" : result.status === "fail" ? "✗" : "○";
+    output += `Status:  ${icon} ${result.status.toUpperCase()} (${(result.latencyMs / 1000).toFixed(1)}s)\n`;
+
+    if (result.error) {
+      output += `Error:   ${result.error}\n`;
+    }
+
+    if (result.tools.length > 0) {
+      output += `\nTools (${result.toolCount}):\n`;
+      for (const tool of result.tools) {
+        output += `  - ${tool}\n`;
+      }
+    }
+
+    // Check if this server exists in other projects
+    const otherInstances = allServers.filter(
+      (s) => s.name === serverName && s.project !== target.project
+    );
+    if (otherInstances.length > 0) {
+      output += `\nAlso configured in:\n`;
+      for (const other of otherInstances) {
+        output += `  - ${other.project} (${other.configFile})\n`;
+      }
+    }
+
+    return {
+      content: [{ type: "text", text: output }],
+    };
+  }
+);
+
+// ─── Tool: list_all_tools ────────────────────────────────────────────────────
+
+server.tool(
+  "list_all_tools",
+  "Fetch complete tool catalog from all discovered MCP servers. Connects to each server live and returns every tool's name, description, and parameters.",
+  {
+    server: z.string().optional().describe("Filter to a specific server name"),
+    project: z.string().optional().describe("Filter to a specific project"),
+  },
+  async ({ server: serverFilter, project }) => {
+    const servers = discoverServers();
+    if (servers.length === 0) {
+      return { content: [{ type: "text", text: "No MCP servers found." }] };
+    }
+
+    const { tools, errors } = await fetchAllTools(servers, serverFilter, project);
+    const output = formatToolList(tools, errors);
+    return { content: [{ type: "text", text: output }] };
+  }
+);
+
+// ─── Tool: search_tools ─────────────────────────────────────────────────────
+
+server.tool(
+  "search_tools",
+  "Search for tools by keyword across all discovered MCP servers. Matches against tool names and descriptions.",
+  {
+    query: z.string().describe("Search term to match against tool names and descriptions"),
+    server: z.string().optional().describe("Limit search to a specific server"),
+    project: z.string().optional().describe("Limit search to a specific project"),
+  },
+  async ({ query, server: serverFilter, project }) => {
+    const servers = discoverServers();
+    if (servers.length === 0) {
+      return { content: [{ type: "text", text: "No MCP servers found." }] };
+    }
+
+    const { tools, errors } = await searchTools(servers, query, serverFilter, project);
+
+    if (tools.length === 0) {
+      let output = `No tools found matching "${query}".`;
+      if (errors.length > 0) {
+        output += `\n\nSome servers had errors:\n`;
+        for (const e of errors) {
+          output += `  ✗ ${e.project}/${e.server}: ${e.error}\n`;
+        }
+      }
+      return { content: [{ type: "text", text: output }] };
+    }
+
+    const output = formatToolList(tools, errors);
+    return { content: [{ type: "text", text: output.replace(/^Found \d+ tools/, `Found ${tools.length} tools matching "${query}"`) }] };
+  }
+);
+
+// ─── Tool: call_tool ────────────────────────────────────────────────────────
+
+server.tool(
+  "call_tool",
+  "Call any tool on any discovered MCP server. Spawns the target server, connects via MCP, invokes the tool, and returns the result. Use list_all_tools or search_tools to discover available tools first.",
+  {
+    server: z.string().describe("Name of the target MCP server (e.g., 'sentry', 'langsmith')"),
+    tool: z.string().describe("Name of the tool to invoke on that server"),
+    arguments: z.string().optional().default("{}").describe("Arguments as a JSON string (e.g. '{\"project_slug\": \"my-project\"}')"),
+    project: z.string().optional().describe("Project name to disambiguate if server exists in multiple projects"),
+  },
+  async ({ server: serverName, tool: toolName, arguments: toolArgsJson, project }) => {
+    const servers = discoverServers();
+
+    let target;
+    try {
+      target = resolveServer(servers, serverName, project);
+    } catch (err) {
+      return {
+        content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
+      };
+    }
+
+    // Parse arguments JSON string
+    let toolArgs: Record<string, unknown>;
+    try {
+      toolArgs = JSON.parse(toolArgsJson) as Record<string, unknown>;
+    } catch {
+      return {
+        content: [{ type: "text" as const, text: `Invalid JSON in arguments: ${toolArgsJson}` }],
+      };
+    }
+
+    try {
+      const result = await callToolOnServer(target, toolName, toolArgs);
+
+      // Log the proxy call
+      saveProxyCall({
+        server: result.serverName,
+        project: target.project,
+        tool: result.toolName,
+        status: result.isError ? "fail" : "ok",
+        latencyMs: result.latencyMs,
+        error: null,
+        calledAt: new Date().toISOString(),
+      });
+
+      // Serialize proxied result as text
+      const header = `[Proxied: ${target.project}/${serverName} → ${toolName} in ${(result.latencyMs / 1000).toFixed(1)}s]`;
+      const body = result.content
+        .map((block) => {
+          if (block.type === "text" && "text" in block) return block.text as string;
+          return JSON.stringify(block, null, 2);
+        })
+        .join("\n");
+
+      return {
+        content: [{ type: "text" as const, text: `${header}\n\n${body}` }],
+      };
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+
+      saveProxyCall({
+        server: serverName,
+        project: target.project,
+        tool: toolName,
+        status: "fail",
+        latencyMs: 0,
+        error: errorMsg,
+        calledAt: new Date().toISOString(),
+      });
+
+      return {
+        content: [{ type: "text" as const, text: `Failed to call ${serverName}/${toolName}: ${errorMsg}` }],
+      };
+    }
+  }
+);
+
+// ─── Start server ───────────────────────────────────────────────────────────
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+main().catch((err) => {
+  console.error("mcp-doc failed to start:", err);
+  process.exit(1);
+});
+
+
+════════════════════════════════════════════════
+  src/proxy.ts
+════════════════════════════════════════════════
+
+import type { DiscoveredServer } from "./scanner.js";
+import { withClient, shouldSkipServer } from "./client.js";
+
+export interface ToolInfo {
+  server: string;
+  project: string;
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+export interface ProxyCallResult {
+  content: Array<{ type: string; [key: string]: unknown }>;
+  isError?: boolean;
+  serverName: string;
+  toolName: string;
+  latencyMs: number;
+}
+
+/**
+ * Format a tool's input schema into a readable parameter signature.
+ */
+function formatParams(schema: Record<string, unknown>): string {
+  const props = schema.properties as Record<string, { type?: string }> | undefined;
+  const required = (schema.required as string[]) || [];
+  if (!props) return "()";
+
+  const params = Object.entries(props).map(([name, def]) => {
+    const type = def?.type || "any";
+    const opt = required.includes(name) ? "" : "?";
+    return `${name}${opt}: ${type}`;
+  });
+
+  return `(${params.join(", ")})`;
+}
+
+/**
+ * Fetch full tool schemas from all (or filtered) servers.
+ */
+export async function fetchAllTools(
+  servers: DiscoveredServer[],
+  serverFilter?: string,
+  projectFilter?: string
+): Promise<{ tools: ToolInfo[]; errors: Array<{ server: string; project: string; error: string }> }> {
+  let filtered = servers;
+  if (serverFilter) {
+    filtered = filtered.filter((s) => s.name === serverFilter);
+  }
+  if (projectFilter) {
+    filtered = filtered.filter((s) =>
+      s.project.toLowerCase().includes(projectFilter.toLowerCase())
+    );
+  }
+
+  const allTools: ToolInfo[] = [];
+  const errors: Array<{ server: string; project: string; error: string }> = [];
+
+  for (const server of filtered) {
+    const skipReason = shouldSkipServer(server);
+    if (skipReason) continue;
+
+    try {
+      const tools = await withClient(server, async (client) => {
+        const result = await client.listTools();
+        return result.tools.map((t) => ({
+          server: server.name,
+          project: server.project,
+          name: t.name,
+          description: t.description || "",
+          inputSchema: (t.inputSchema || {}) as Record<string, unknown>,
+        }));
+      });
+      allTools.push(...tools);
+    } catch (err) {
+      errors.push({
+        server: server.name,
+        project: server.project,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return { tools: allTools, errors };
+}
+
+/**
+ * Search for tools by keyword across servers.
+ */
+export async function searchTools(
+  servers: DiscoveredServer[],
+  query: string,
+  serverFilter?: string,
+  projectFilter?: string
+): Promise<{ tools: ToolInfo[]; errors: Array<{ server: string; project: string; error: string }> }> {
+  const { tools, errors } = await fetchAllTools(servers, serverFilter, projectFilter);
+  const q = query.toLowerCase();
+
+  const matched = tools.filter(
+    (t) =>
+      t.name.toLowerCase().includes(q) ||
+      t.description.toLowerCase().includes(q)
+  );
+
+  return { tools: matched, errors };
+}
+
+/**
+ * Format tool list into readable output.
+ */
+export function formatToolList(
+  tools: ToolInfo[],
+  errors: Array<{ server: string; project: string; error: string }>
+): string {
+  if (tools.length === 0 && errors.length === 0) {
+    return "No tools found.";
+  }
+
+  // Group by server
+  const byServer = new Map<string, ToolInfo[]>();
+  for (const t of tools) {
+    const key = `${t.project}/${t.server}`;
+    const group = byServer.get(key) || [];
+    group.push(t);
+    byServer.set(key, group);
+  }
+
+  let output = `Found ${tools.length} tools across ${byServer.size} servers:\n\n`;
+
+  for (const [serverKey, serverTools] of byServer) {
+    output += `${serverKey} (${serverTools.length} tools):\n`;
+    for (const t of serverTools) {
+      const params = formatParams(t.inputSchema);
+      output += `  - ${t.name}${params}`;
+      if (t.description) {
+        const desc = t.description.length > 80
+          ? t.description.substring(0, 77) + "..."
+          : t.description;
+        output += ` — ${desc}`;
+      }
+      output += "\n";
+    }
+    output += "\n";
+  }
+
+  if (errors.length > 0) {
+    output += `Errors (${errors.length}):\n`;
+    for (const e of errors) {
+      output += `  ✗ ${e.project}/${e.server}: ${e.error}\n`;
+    }
+  }
+
+  return output;
+}
+
+/**
+ * Call a tool on a specific server. Validates the tool exists first.
+ */
+export async function callToolOnServer(
+  server: DiscoveredServer,
+  toolName: string,
+  args: Record<string, unknown>
+): Promise<ProxyCallResult> {
+  const start = Date.now();
+
+  return await withClient(server, async (client) => {
+    // Validate tool exists
+    const toolsResult = await client.listTools();
+    const tool = toolsResult.tools.find((t) => t.name === toolName);
+    if (!tool) {
+      const available = toolsResult.tools.map((t) => t.name).join(", ");
+      throw new Error(
+        `Tool "${toolName}" not found on ${server.name}. Available: ${available}`
+      );
+    }
+
+    // Call the tool
+    const result = await client.callTool({ name: toolName, arguments: args });
+
+    return {
+      content: result.content as Array<{ type: string; [key: string]: unknown }>,
+      isError: result.isError as boolean | undefined,
+      serverName: server.name,
+      toolName,
+      latencyMs: Date.now() - start,
+    };
+  });
+}
+
+
+════════════════════════════════════════════════
+  src/scanner.ts
+════════════════════════════════════════════════
+
+import { readFileSync, existsSync, readdirSync, statSync } from "fs";
+import { join, basename } from "path";
+import { homedir } from "os";
+
+export interface ServerConfig {
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  type?: string;
+}
+
+export interface DiscoveredServer {
+  name: string;
+  project: string;
+  projectPath: string;
+  configFile: string;
+  config: ServerConfig;
+}
+
+interface ClaudeJsonProject {
+  mcpServers?: Record<string, ServerConfig>;
+  [key: string]: unknown;
+}
+
+interface McpJsonFile {
+  mcpServers?: Record<string, ServerConfig>;
+}
+
+function readJsonSafe<T>(filePath: string): T | null {
+  try {
+    if (!existsSync(filePath)) return null;
+    return JSON.parse(readFileSync(filePath, "utf-8")) as T;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Scan ~/.claude.json for MCP servers configured under projects.
+ */
+function scanClaudeGlobal(): DiscoveredServer[] {
+  const servers: DiscoveredServer[] = [];
+  const claudeJsonPath = join(homedir(), ".claude.json");
+  const data = readJsonSafe<{ projects?: Record<string, ClaudeJsonProject> }>(claudeJsonPath);
+  if (!data?.projects) return servers;
+
+  for (const [projectPath, projectConfig] of Object.entries(data.projects)) {
+    const mcpServers = projectConfig.mcpServers;
+    if (!mcpServers || Object.keys(mcpServers).length === 0) continue;
+
+    for (const [name, config] of Object.entries(mcpServers)) {
+      servers.push({
+        name,
+        project: basename(projectPath),
+        projectPath,
+        configFile: claudeJsonPath,
+        config,
+      });
+    }
+  }
+
+  return servers;
+}
+
+/**
+ * Scan .mcp.json files in project directories.
+ * Looks in common dev directories and any projects found in ~/.claude.json.
+ */
+function scanMcpJsonFiles(projectDirs: string[]): DiscoveredServer[] {
+  const servers: DiscoveredServer[] = [];
+  const seen = new Set<string>();
+
+  for (const dir of projectDirs) {
+    const mcpJsonPath = join(dir, ".mcp.json");
+    if (seen.has(mcpJsonPath)) continue;
+    seen.add(mcpJsonPath);
+
+    const data = readJsonSafe<McpJsonFile>(mcpJsonPath);
+    if (!data?.mcpServers) continue;
+
+    for (const [name, config] of Object.entries(data.mcpServers)) {
+      servers.push({
+        name,
+        project: basename(dir),
+        projectPath: dir,
+        configFile: mcpJsonPath,
+        config,
+      });
+    }
+  }
+
+  return servers;
+}
+
+/**
+ * Scan Cursor global MCP config.
+ */
+function scanCursorGlobal(): DiscoveredServer[] {
+  const servers: DiscoveredServer[] = [];
+  const cursorConfigPath = join(homedir(), ".cursor", "mcp.json");
+  const data = readJsonSafe<McpJsonFile>(cursorConfigPath);
+  if (!data?.mcpServers) return servers;
+
+  for (const [name, config] of Object.entries(data.mcpServers)) {
+    servers.push({
+      name,
+      project: "(cursor-global)",
+      projectPath: "",
+      configFile: cursorConfigPath,
+      config,
+    });
+  }
+
+  return servers;
+}
+
+/**
+ * Scan VS Code .vscode/mcp.json files in project directories.
+ */
+function scanVscodeMcpFiles(projectDirs: string[]): DiscoveredServer[] {
+  const servers: DiscoveredServer[] = [];
+  const seen = new Set<string>();
+
+  for (const dir of projectDirs) {
+    const vscodeMcpPath = join(dir, ".vscode", "mcp.json");
+    if (seen.has(vscodeMcpPath)) continue;
+    seen.add(vscodeMcpPath);
+
+    const data = readJsonSafe<McpJsonFile>(vscodeMcpPath);
+    if (!data?.mcpServers) continue;
+
+    for (const [name, config] of Object.entries(data.mcpServers)) {
+      servers.push({
+        name,
+        project: basename(dir),
+        projectPath: dir,
+        configFile: vscodeMcpPath,
+        config,
+      });
+    }
+  }
+
+  return servers;
+}
+
+/**
+ * Collect all known project directories from multiple sources.
+ */
+function collectProjectDirs(): string[] {
+  const dirs = new Set<string>();
+
+  // From ~/.claude.json projects
+  const claudeJsonPath = join(homedir(), ".claude.json");
+  const claudeData = readJsonSafe<{ projects?: Record<string, unknown> }>(claudeJsonPath);
+  if (claudeData?.projects) {
+    for (const projectPath of Object.keys(claudeData.projects)) {
+      if (existsSync(projectPath)) {
+        dirs.add(projectPath);
+      }
+    }
+  }
+
+  // Scan common dev directories for .mcp.json files
+  const commonDevDirs = [
+    join(homedir(), "Desktop"),
+    join(homedir(), "Documents"),
+    join(homedir(), "Projects"),
+    join(homedir(), "projects"),
+    join(homedir(), "dev"),
+    join(homedir(), "src"),
+    join(homedir(), "code"),
+    join(homedir(), "workspace"),
+  ];
+
+  for (const devDir of commonDevDirs) {
+    if (!existsSync(devDir)) continue;
+    try {
+      const entries = readdirSync(devDir);
+      for (const entry of entries) {
+        const fullPath = join(devDir, entry);
+        try {
+          if (statSync(fullPath).isDirectory()) {
+            // Check one level deeper too (e.g., ~/Desktop/MattsPyProjects/totetaxi)
+            if (existsSync(join(fullPath, ".mcp.json"))) {
+              dirs.add(fullPath);
+            }
+            // Scan subdirectories
+            const subEntries = readdirSync(fullPath);
+            for (const subEntry of subEntries) {
+              const subPath = join(fullPath, subEntry);
+              try {
+                if (statSync(subPath).isDirectory() && existsSync(join(subPath, ".mcp.json"))) {
+                  dirs.add(subPath);
+                }
+              } catch {
+                // Skip inaccessible dirs
+              }
+            }
+          }
+        } catch {
+          // Skip inaccessible dirs
+        }
+      }
+    } catch {
+      // Skip inaccessible dirs
+    }
+  }
+
+  return Array.from(dirs);
+}
+
+/**
+ * Discover all MCP servers across all config sources.
+ * Deduplicates servers that appear in multiple locations.
+ */
+export function discoverServers(): DiscoveredServer[] {
+  const projectDirs = collectProjectDirs();
+  const allServers: DiscoveredServer[] = [
+    ...scanClaudeGlobal(),
+    ...scanMcpJsonFiles(projectDirs),
+    ...scanCursorGlobal(),
+    ...scanVscodeMcpFiles(projectDirs),
+  ];
+
+  // Deduplicate: same server name + same project = keep the .mcp.json version (more specific)
+  const seen = new Map<string, DiscoveredServer>();
+  for (const server of allServers) {
+    const key = `${server.project}::${server.name}`;
+    const existing = seen.get(key);
+    if (!existing) {
+      seen.set(key, server);
+    } else if (server.configFile.endsWith(".mcp.json") && !existing.configFile.endsWith(".mcp.json")) {
+      // .mcp.json takes priority over ~/.claude.json
+      seen.set(key, server);
+    }
+  }
+
+  return Array.from(seen.values());
+}
+
+/**
+ * Find servers that share the same command/args across different projects.
+ */
+export function findDuplicates(servers: DiscoveredServer[]): Map<string, DiscoveredServer[]> {
+  const groups = new Map<string, DiscoveredServer[]>();
+
+  for (const server of servers) {
+    // Create a fingerprint based on command + package name (strip versions and flags)
+    const cmd = server.config.command || server.config.url || "unknown";
+    const meaningfulArg = (server.config.args || []).find((a) => !a.startsWith("-")) || "";
+    // Strip version suffixes: @sentry/mcp-server@0.29.0 → @sentry/mcp-server
+    const packageName = meaningfulArg.replace(/@[\d.]+[-\w.]*$/, "").replace(/@latest$/, "");
+    const fingerprint = `${cmd}::${packageName}`;
+
+    const group = groups.get(fingerprint) || [];
+    group.push(server);
+    groups.set(fingerprint, group);
+  }
+
+  // Only return groups with duplicates
+  const duplicates = new Map<string, DiscoveredServer[]>();
+  for (const [key, group] of groups) {
+    if (group.length > 1) {
+      duplicates.set(key, group);
+    }
+  }
+
+  return duplicates;
+}
+
+
+════════════════════════════════════════════════
+  BUILD_LOG.md
+════════════════════════════════════════════════
+
+# Build Log: mcp-doc — From Crash to Meta MCP Server
+
+*A chronicle of building an MCP server that monitors, discovers, and proxies all your other MCP servers.*
+
+---
+
+## Phase 1: The Crash
+
+**Problem:** Installing mcp-doc as an MCP server crashed both VS Code and Claude Code immediately on startup.
+
+**Root cause:** The `better-sqlite3` dependency is a native C++ addon compiled against a specific Node.js ABI version. When VS Code or Claude Code spawns an MCP server, they use their own Node.js/Electron runtime — which has a different ABI than the system Node.js that compiled the native module. This causes a segfault that kills the entire host process. Not an error. Not an exception. A hard crash.
+
+**Decision:** Replace `better-sqlite3` with a plain JSON file for history storage. SQLite was overkill for what's essentially a simple append log of health check results. The JSON approach:
+- Zero native dependencies (no ABI issues, ever)
+- Works in any Node.js runtime
+- History capped at 500 entries to keep the file small
+- Dropped 36 packages from the dependency tree
+
+**Lesson learned:** Native Node.js addons are a ticking time bomb in MCP servers. MCP servers run as child processes inside IDE runtimes you don't control. Pure JavaScript dependencies only.
+
+## Phase 2: Bug Fixes
+
+### Self-Check Infinite Recursion Guard
+
+The health checker spawns each discovered MCP server to test it. But what if it discovers *itself*? It would spawn itself, which would discover itself, which would spawn itself...
+
+The original guard only checked if the command string contained "mcp-doc". But if someone configured it as `npx @mnraynor90/mcp-doc`, the package name check could miss. Fixed by also checking:
+- The npm scoped package name (`@mnraynor90/mcp-doc`)
+- The server name field (`server.name === "mcp-doc"`)
+
+### Credential Leaking in Output
+
+Running `list_servers` revealed that database connection strings were shown in full, including passwords:
+
+```
+postgres://postgres:****@yamanote.proxy.rlwy.net:10478/railway
+```
+
+The existing `redactArgs()` function only caught token-style prefixes (`sk-`, `ghp_`, etc.). Added URL password detection using the `URL` constructor — any `scheme://user:password@host` pattern now gets the password replaced with `****`.
+
+## Phase 3: Designing the Meta MCP Server
+
+### The Idea
+
+mcp-doc started as a health checker — "are my servers up?" But the real question users have is: "what can all my servers *do*?"
+
+With 9 MCP servers across 3 projects exposing 136 tools, it's genuinely hard to remember which server has which tool. The idea: turn mcp-doc into a **meta MCP server** — a gateway that can discover, inspect, and invoke tools on any MCP server configured on your machine.
+
+### Risk Analysis
+
+Before building, we identified key risks:
+
+1. **Permission bypass**: MCP hosts (VS Code, Claude Code) normally gate each tool call individually. A proxy that calls any tool through a single `call_tool` gateway bypasses that per-tool approval. The user only approves "mcp-doc: call_tool" — not the underlying operation.
+
+2. **Process spawning overhead**: Every proxied call spawns a new server process, does a full MCP handshake, calls one tool, and tears down. That's 1-2 seconds of overhead for something the host could do directly.
+
+3. **Orphaned processes**: If mcp-doc crashes mid-proxy-call, child processes could be left running.
+
+### Mitigations
+
+- **Tool validation**: `call_tool` verifies the target tool exists (calls `listTools()` first) before invoking it
+- **Transparency header**: Every proxied response includes which server/tool was called and how long it took
+- **Audit logging**: All `call_tool` invocations are logged to the history file
+- **Forced cleanup**: `withClient()` always kills child processes in a `finally` block
+- **30-second timeout**: Operations that hang get killed via `Promise.race()`
+
+### Decision: Build It Anyway
+
+The cross-project use case is real: you're working in Project A but need data from a server only configured in Project B. And the discovery tools (`list_all_tools`, `search_tools`) are useful regardless — they turn mcp-doc into living documentation for your entire MCP ecosystem.
+
+## Phase 4: Architecture Refactor
+
+### Replacing Raw JSON-RPC with the SDK Client
+
+The original health checker used hand-rolled JSON-RPC over raw `child_process.spawn()` — about 80 lines of custom protocol code. The `@modelcontextprotocol/sdk` already provides a `Client` class with `StdioClientTransport` that handles all of this correctly.
+
+**Created `src/client.ts`** — a shared module with:
+- `withClient(server, fn, timeout)`: Spawn → connect → run callback → always clean up
+- `shouldSkipServer(server)`: Centralized self-check and remote server guards
+- `resolveServer(servers, name, project?)`: Find a server by name with disambiguation
+
+This let us rewrite `health.ts` from ~160 lines to ~80 lines while adding better timeout handling and process cleanup.
+
+### New Module: `src/proxy.ts`
+
+The proxy operations module provides:
+- `fetchAllTools()`: Connect to servers, return full tool schemas with parameter signatures
+- `searchTools()`: Fetch all tools, then filter by keyword match on name/description
+- `callToolOnServer()`: Connect, validate tool exists, call it, return result
+- `formatToolList()`: Pretty-print tool catalogs with parameter signatures
+
+## Phase 5: The New Tools
+
+### `list_all_tools`
+Connects to every discovered server and fetches complete tool schemas. Shows each tool's name, parameters (with types and required/optional), and description. Result: a full catalog of 136 tools across 9 servers.
+
+### `search_tools`
+"Which of my 136 tools can handle issues?" — searches tool names and descriptions across all servers. Found 14 tools matching "issue" across both Sentry instances.
+
+### `call_tool`
+The proxy itself. Takes a server name, tool name, and arguments. Spawns the target server, connects via MCP, calls the tool, returns the result. First successful test: proxied `railway/list-projects` and got back real project data in 1.2 seconds.
+
+## Phase 6: Results
+
+### Before (v0.1.0)
+- 4 tools: list_servers, check_health, server_history, server_detail
+- Crashed VS Code and Claude Code on startup
+- Leaked database passwords in output
+- Raw JSON-RPC protocol handling
+
+### After (v0.2.0)
+- 7 tools: + list_all_tools, search_tools, call_tool
+- Zero native dependencies (no more crashes)
+- Credential redaction for URLs
+- SDK-based client with proper cleanup
+- Audit logging for proxied calls
+- Full meta MCP gateway capability
+
+### What This Means
+
+You can now ask Claude: "What tools do I have across all my projects?" and get a real answer. You can search for capabilities by keyword. And you can invoke any tool on any server from any project — turning a health checker into a universal MCP gateway.
+
+---
+
+*Built with Claude Code. Every decision, every bug, every fix — documented as it happened.*
+
+
+════════════════════════════════════════════════
+  CLAUDE.md
+════════════════════════════════════════════════
+
+# mcp-doc
+
+Meta MCP server that discovers, health-checks, and proxies all your other MCP servers.
+
+## Quick Reference
+
+- **Build:** `npm run build` (TypeScript → dist/)
+- **Dev:** `npm run dev` (watch mode)
+- **Start:** `npm start` or `node dist/index.js`
+- **Publish:** `npm publish --access public` (requires npm 2FA)
+- **Package:** `@mnraynor90/mcp-doc` on npm, currently v0.2.0
+
+## Architecture
+
+```
+src/
+  index.ts      → MCP server entry point, registers all 7 tools
+  scanner.ts    → Discovers MCP servers from config files across the machine
+  health.ts     → Health-checks servers (spawn → MCP handshake → listTools)
+  history.ts    → JSON file storage at ~/.mcp-doc/history.json (500 entry cap)
+  client.ts     → Shared MCP client lifecycle (withClient, shouldSkipServer, resolveServer)
+  proxy.ts      → Tool catalog fetching, search, and proxied tool calls
+```
+
+### Data Flow
+
+Scanner discovers configs → Client spawns servers temporarily → Health/Proxy operations run → History persists results
+
+### Key Patterns
+
+- **No native dependencies.** better-sqlite3 was removed because native addons crash IDE runtimes (ABI mismatch). JSON file storage only.
+- **`withClient(server, fn, timeout)`** is the core pattern: spawn → connect → run callback → always clean up (finally block kills child process).
+- **30-second timeout** on all client operations via `Promise.race()`.
+- **Self-check guard** in `shouldSkipServer()` prevents infinite recursion (checks command, package name, and server.name).
+- **Sequential health checks** to avoid spawning too many processes at once.
+- **Credential redaction** in `redactArgs()` — catches tokens (sk-, ghp_, etc.) and URL passwords via the URL constructor.
+
+## MCP Tools (7 total)
+
+| Tool | Purpose |
+|------|---------|
+| `list_servers` | Discover all configured MCP servers across projects/IDEs |
+| `check_health` | Spawn and verify each server responds to MCP handshake |
+| `server_history` | Show past health check results and uptime stats |
+| `server_detail` | Deep inspection: config, live check, tool list, duplicates |
+| `list_all_tools` | Fetch full tool catalog with parameter schemas from all servers |
+| `search_tools` | Search tools by keyword across all servers |
+| `call_tool` | Proxy: call any tool on any server from any project context |
+
+## Config Sources Scanned
+
+- `~/.claude.json` → global Claude Code projects
+- `<project>/.mcp.json` → per-project Claude Code
+- `~/.cursor/mcp.json` → Cursor global
+- `<project>/.vscode/mcp.json` → VS Code per-project
+- Scans ~/Desktop, ~/Documents, ~/Projects, ~/dev, ~/src, ~/code, ~/workspace (2 levels deep)
+
+## Important Constraints
+
+- MCP servers run as child processes in IDE runtimes — never use native Node.js addons.
+- `call_tool` accepts arguments as a JSON string (`z.string()`), not a typed object. This is because tool schemas are dynamic/unknown at registration time.
+- The proxy bypasses the host's per-tool permission model — the host only approves "call_tool", not the underlying operation.
+- History is stored at `~/.mcp-doc/history.json`, not in the project directory.
+- `scanner.ts` uses synchronous fs reads — fine for config files, don't extend this pattern to large files.
+
+## TypeScript Config
+
+- Target: ES2022, Module: Node16 (ESM with `"type": "module"` in package.json)
+- Strict mode enabled
+- All imports use `.js` extensions (required for Node16 module resolution)
+
